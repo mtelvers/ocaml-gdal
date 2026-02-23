@@ -1,0 +1,3 @@
+(executables
+ (names read_raster gc_stress)
+ (libraries gdal))

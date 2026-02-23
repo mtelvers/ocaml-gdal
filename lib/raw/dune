@@ -1,0 +1,5 @@
+(library
+ (name gdal_raw)
+ (public_name gdal.raw)
+ (libraries ctypes ctypes-foreign)
+ (c_library_flags -lgdal))
