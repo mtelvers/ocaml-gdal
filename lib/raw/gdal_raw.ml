@@ -259,3 +259,8 @@ let get_description =
 let get_driver_long_name =
   foreign ~from:libgdal "GDALGetDriverLongName"
     (driver_h @-> returning string)
+
+(* VSI file copy *)
+let cpl_copy_file =
+  foreign ~from:libgdal ~release_runtime_lock:true "CPLCopyFile"
+    (string @-> string @-> returning int)

@@ -79,9 +79,11 @@ module Driver : sig
     width:int ->
     height:int ->
     bands:int ->
+    ?options:string list ->
     data_type ->
     (dataset, string) result
-  (** Create a new raster dataset. *)
+  (** Create a new raster dataset. [options] are driver-specific creation
+      options such as ["COMPRESS=DEFLATE"] or ["TILED=YES"]. *)
 
   val description : driver -> string
   (** The long name / description of the driver (e.g. ["GeoTIFF"]). *)
@@ -250,3 +252,9 @@ module CoordinateTransformation : sig
 
   val destroy : t -> unit
 end
+
+(** {1 File operations} *)
+
+val copy_file : src:string -> dst:string -> (unit, string) result
+(** [copy_file ~src ~dst] copies a file using GDAL's virtual filesystem.
+    Works with VSI paths (e.g. [/vsicurl/https://...]). *)

@@ -208,12 +208,21 @@ module Driver = struct
       ("Driver not found: " ^ name) in
     Ok ({ raw } : driver)
 
-  let create (driver : driver) ~filename ~width ~height ~bands dtype =
-    let* raw = check_null
-      (Gdal_raw.create driver.raw filename width height bands
-         (data_type_to_int dtype) None)
-      ("Failed to create " ^ filename) in
-    wrap_dataset raw
+  let create (driver : driver) ~filename ~width ~height ~bands ?(options = []) dtype =
+    if options = [] then
+      let* raw = check_null
+        (Gdal_raw.create driver.raw filename width height bands
+           (data_type_to_int dtype) None)
+        ("Failed to create " ^ filename) in
+      wrap_dataset raw
+    else
+      with_csl options (fun opts_arr ->
+        let raw = Gdal_raw.create driver.raw filename width height bands
+          (data_type_to_int dtype) (Some opts_arr) in
+        if Ctypes.is_null raw then
+          Error ("Failed to create " ^ filename)
+        else
+          wrap_dataset raw)
 
   let description (driver : driver) =
     Gdal_raw.get_driver_long_name driver.raw
@@ -523,3 +532,10 @@ module CoordinateTransformation = struct
 
   let destroy ct = finalise_ct ct
 end
+
+(** {1 File operations} *)
+
+let copy_file ~src ~dst =
+  let rc = Gdal_raw.cpl_copy_file dst src in
+  if rc = 0 then Ok ()
+  else Error (Printf.sprintf "CPLCopyFile failed: %s -> %s" src dst)
