@@ -30,8 +30,14 @@ let gdt_uint32 = 4
 let gdt_int32 = 5
 let gdt_float32 = 6
 let gdt_float64 = 7
-let gdt_int64 = 12
+let gdt_cint16 = 8
+let gdt_cint32 = 9
+let gdt_cfloat32 = 10
+let gdt_cfloat64 = 11
+let gdt_uint64 = 12
+let gdt_int64 = 13
 let gdt_int8 = 14
+let gdt_float16 = 15
 
 (* CPLErr enum *)
 let ce_none = 0
@@ -39,6 +45,10 @@ let ce_debug = 1
 let ce_warning = 2
 let ce_failure = 3
 let ce_fatal = 4
+
+(* Version *)
+let version_info =
+  foreign ~from:libgdal "GDALVersionInfo" (string @-> returning string)
 
 (* Registration *)
 let all_register =

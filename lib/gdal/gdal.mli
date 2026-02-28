@@ -10,7 +10,14 @@ type data_type =
   | Int32
   | Float32
   | Float64
+  | CInt16
+  | CInt32
+  | CFloat32
+  | CFloat64
+  | UInt64
+  | Int64
   | Int8
+  | Float16
   | Unknown
 
 val data_type_to_int : data_type -> int

@@ -12,8 +12,18 @@ type data_type =
   | Int32
   | Float32
   | Float64
+  | CInt16
+  | CInt32
+  | CFloat32
+  | CFloat64
+  | UInt64
+  | Int64
   | Int8
+  | Float16
   | Unknown
+
+let gdal_version_num =
+  lazy (int_of_string (Gdal_raw.version_info "VERSION_NUM"))
 
 let data_type_to_int = function
   | Byte -> Gdal_raw.gdt_byte
@@ -23,7 +33,17 @@ let data_type_to_int = function
   | Int32 -> Gdal_raw.gdt_int32
   | Float32 -> Gdal_raw.gdt_float32
   | Float64 -> Gdal_raw.gdt_float64
+  | CInt16 -> Gdal_raw.gdt_cint16
+  | CInt32 -> Gdal_raw.gdt_cint32
+  | CFloat32 -> Gdal_raw.gdt_cfloat32
+  | CFloat64 -> Gdal_raw.gdt_cfloat64
+  | UInt64 -> Gdal_raw.gdt_uint64
+  | Int64 -> Gdal_raw.gdt_int64
   | Int8 -> Gdal_raw.gdt_int8
+  | Float16 ->
+    if Lazy.force gdal_version_num < 3110000 then
+      failwith "Float16 requires GDAL >= 3.11"
+    else Gdal_raw.gdt_float16
   | Unknown -> Gdal_raw.gdt_unknown
 
 let data_type_of_int = function
@@ -34,7 +54,14 @@ let data_type_of_int = function
   | n when n = Gdal_raw.gdt_int32 -> Int32
   | n when n = Gdal_raw.gdt_float32 -> Float32
   | n when n = Gdal_raw.gdt_float64 -> Float64
+  | n when n = Gdal_raw.gdt_cint16 -> CInt16
+  | n when n = Gdal_raw.gdt_cint32 -> CInt32
+  | n when n = Gdal_raw.gdt_cfloat32 -> CFloat32
+  | n when n = Gdal_raw.gdt_cfloat64 -> CFloat64
+  | n when n = Gdal_raw.gdt_uint64 -> UInt64
+  | n when n = Gdal_raw.gdt_int64 -> Int64
   | n when n = Gdal_raw.gdt_int8 -> Int8
+  | n when n = Gdal_raw.gdt_float16 -> Float16
   | _ -> Unknown
 
 let string_of_data_type = function
@@ -45,7 +72,14 @@ let string_of_data_type = function
   | Int32 -> "Int32"
   | Float32 -> "Float32"
   | Float64 -> "Float64"
+  | CInt16 -> "CInt16"
+  | CInt32 -> "CInt32"
+  | CFloat32 -> "CFloat32"
+  | CFloat64 -> "CFloat64"
+  | UInt64 -> "UInt64"
+  | Int64 -> "Int64"
   | Int8 -> "Int8"
+  | Float16 -> "Float16"
   | Unknown -> "Unknown"
 
 type access = ReadOnly | Update
