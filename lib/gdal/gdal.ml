@@ -140,6 +140,8 @@ let check_null ptr what =
 
 let init () = Gdal_raw.all_register ()
 
+let usable_physical_ram () = Gdal_raw.usable_physical_ram ()
+
 (* ---- Configuration ---- *)
 
 let set_config_option key value =

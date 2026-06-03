@@ -49,6 +49,11 @@ type geo_transform = {
 val init : unit -> unit
 (** Register all GDAL drivers. Call once before using other functions. *)
 
+val usable_physical_ram : unit -> int64
+(** Usable physical RAM in bytes, or [0L] if it cannot be determined. Wraps
+    GDAL's [CPLGetUsablePhysicalRAM], which is implemented per-platform
+    (Linux [/proc], macOS/BSD [sysctl], Windows [GlobalMemoryStatusEx]). *)
+
 (** {1 Configuration} *)
 
 val set_config_option : string -> string -> unit

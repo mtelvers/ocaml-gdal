@@ -50,6 +50,11 @@ let ce_fatal = 4
 let version_info =
   foreign ~from:libgdal "GDALVersionInfo" (string @-> returning string)
 
+(* CPLGetUsablePhysicalRAM: usable physical RAM in bytes, 0 if unknown.
+   Cross-platform (Linux /proc, macOS/BSD sysctl, Windows GlobalMemoryStatusEx). *)
+let usable_physical_ram =
+  foreign ~from:libgdal "CPLGetUsablePhysicalRAM" (void @-> returning int64_t)
+
 (* Registration *)
 let all_register =
   foreign ~from:libgdal "GDALAllRegister" (void @-> returning void)
