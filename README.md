@@ -1,13 +1,15 @@
 # gdal-ocaml
 
-OCaml bindings to [GDAL](https://gdal.org/)'s raster C API via
-[ctypes](https://github.com/yallop/ocaml-ctypes).
+OCaml bindings to [GDAL](https://gdal.org/)'s raster and vector (OGR) C APIs
+via [ctypes](https://github.com/yallop/ocaml-ctypes).
 
 ## Features
 
 - Two-layer architecture: thin ctypes FFI (`gdal.raw`) plus idiomatic OCaml
   wrappers with `result` types
 - Type-safe raster I/O through Bigarray with a GADT witness for element types
+- Vector (OGR) reading: layers, features, attribute fields, geometry trees,
+  spatial and attribute filters, in-place reprojection
 - Coordinate transformation and spatial reference support (EPSG, WKT)
 - Dataset warping (`GDALWarp`) and format conversion (`GDALTranslate`)
 - GC-safe: datasets are released by finalisers, bands hold a reference to their
@@ -148,10 +150,88 @@ Gdal.CoordinateTransformation.create : SpatialReference.t -> SpatialReference.t 
                                         (t, string) result
 Gdal.CoordinateTransformation.transform_point : t -> x:float -> y:float -> z:float ->
                                                   (float * float * float, string) result
+Gdal.CoordinateTransformation.transform_points : t -> (float * float) array ->
+                                                   ((float * float) array, string) result
 Gdal.CoordinateTransformation.transform_bounds : t -> xmin:float -> ymin:float ->
                                                    xmax:float -> ymax:float -> density:int ->
                                                    (float * float * float * float, string) result
 Gdal.CoordinateTransformation.destroy : t -> unit
+```
+
+`transform_points` transforms a whole vertex array in one FFI call; prefer it
+over repeated `transform_point` for rings and tracks.
+
+### Vector (OGR)
+
+Datasets opened through `Gdal.Vector` expose layers of features, each with
+attribute fields and a geometry.
+
+```ocaml
+Gdal.Vector.open_        : ?flags:int -> string -> (dataset, string) result
+Gdal.Vector.with_dataset : ?flags:int -> string -> (dataset -> 'a) -> ('a, string) result
+
+Gdal.Vector.Layer.count      : dataset -> int
+Gdal.Vector.Layer.get        : dataset -> int -> (layer, string) result
+Gdal.Vector.Layer.by_name    : dataset -> string -> (layer, string) result
+Gdal.Vector.Layer.name       : layer -> string
+Gdal.Vector.Layer.geometry_type  : layer -> geometry_type
+Gdal.Vector.Layer.feature_count  : ?force:bool -> layer -> int
+Gdal.Vector.Layer.spatial_reference : layer -> SpatialReference.t option
+Gdal.Vector.Layer.extent     : ?force:bool -> layer -> (envelope, string) result
+Gdal.Vector.Layer.fields     : layer -> string list
+Gdal.Vector.Layer.set_spatial_filter_rect :
+  layer -> min_x:float -> min_y:float -> max_x:float -> max_y:float -> unit
+Gdal.Vector.Layer.set_attribute_filter : layer -> string option -> (unit, string) result
+Gdal.Vector.Layer.fold  : layer -> init:'a -> f:('a -> feature -> 'a) -> 'a
+Gdal.Vector.Layer.iter  : layer -> f:(feature -> unit) -> unit
+Gdal.Vector.Layer.next_feature : layer -> feature option
+
+Gdal.Vector.Feature.geometry      : feature -> geometry option
+Gdal.Vector.Feature.attributes    : feature -> (string * string) list
+Gdal.Vector.Feature.field_by_name : feature -> string -> string option
+Gdal.Vector.Feature.destroy       : feature -> unit
+
+Gdal.Vector.Geometry.geometry_type : geometry -> geometry_type
+Gdal.Vector.Geometry.sub_count : geometry -> int
+Gdal.Vector.Geometry.sub       : geometry -> int -> geometry option
+Gdal.Vector.Geometry.points    : geometry -> (float * float) array
+Gdal.Vector.Geometry.rings     : geometry -> (float * float) array list
+Gdal.Vector.Geometry.envelope  : geometry -> envelope
+Gdal.Vector.Geometry.transform_to : geometry -> SpatialReference.t -> (unit, string) result
+Gdal.Vector.Geometry.clone     : geometry -> (geometry, string) result
+```
+
+`Geometry.rings` flattens the geometry tree to its vertex-bearing leaves: for a
+polygon its exterior ring and holes, for a multipolygon or collection each
+member's rings, recursively. Holes are not distinguished from exteriors, which
+is what an even-odd (ray-casting) point-in-polygon test wants — a point inside a
+hole is enclosed by both the hole and the exterior ring, so it counts twice and
+correctly tests as outside.
+
+Ownership follows the C API: a layer belongs to its dataset, a feature from
+`next_feature`/`fold`/`iter` belongs to the caller (`fold` and `iter` destroy
+each one when the callback returns), and a geometry from `Feature.geometry` is
+borrowed from its feature. Using a geometry after its feature is gone raises
+`Invalid_argument` instead of crashing; `Geometry.clone` returns a copy that can
+outlive the feature.
+
+Reading a zipped shapefile and reprojecting it to WGS84:
+
+```ocaml
+let () =
+  Gdal.init ();
+  let wgs84 = Result.get_ok (Gdal.SpatialReference.of_epsg 4326) in
+  Gdal.Vector.with_dataset "/vsizip/roi.zip" (fun ds ->
+    let layer = Result.get_ok (Gdal.Vector.Layer.get ds 0) in
+    Gdal.Vector.Layer.iter layer ~f:(fun feat ->
+      match Gdal.Vector.Feature.geometry feat with
+      | None -> ()
+      | Some g ->
+        ignore (Gdal.Vector.Geometry.transform_to g wgs84);
+        List.iter
+          (fun ring -> Printf.printf "ring of %d vertices\n" (Array.length ring))
+          (Gdal.Vector.Geometry.rings g)))
+  |> Result.iter_error (Printf.eprintf "%s\n")
 ```
 
 ## Examples
@@ -160,6 +240,8 @@ The `examples/` directory contains:
 
 - **read_raster.ml** -- open a raster file and print its metadata and first few
   pixel values
+- **read_vector.ml** -- summarise every layer of a vector file: CRS, extent,
+  fields, and the ring structure of the first few features
 - **gc_stress.ml** -- multi-domain stress test exercising concurrent dataset
   reads under GC pressure
 
@@ -167,15 +249,16 @@ Build and run:
 
 ```
 dune exec examples/read_raster.exe -- path/to/file.tif
+dune exec examples/read_vector.exe -- path/to/boundary.geojson
 ```
 
 ## Tests
 
-The test suite uses [Alcotest](https://github.com/mirage/alcotest) with 56
+The test suite uses [Alcotest](https://github.com/mirage/alcotest) with 67
 tests covering enums, drivers, datasets, raster band I/O, spatial references,
-coordinate transformations, and warp/translate. When Python 3 with GDAL bindings
-is available, additional cross-validation tests compare OCaml results against
-the Python GDAL API.
+coordinate transformations, warp/translate, and the vector API. When Python 3
+with GDAL bindings is available, additional cross-validation tests compare OCaml
+results against the Python GDAL API.
 
 ```
 dune test

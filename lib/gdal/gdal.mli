@@ -1,4 +1,4 @@
-(** OCaml bindings to GDAL's raster C API. *)
+(** OCaml bindings to GDAL's raster and vector (OGR) C APIs. *)
 
 (** {1 Enumerations} *)
 
@@ -230,6 +230,17 @@ module SpatialReference : sig
       (0) for lon/lat = x/y, or [oams_authority_compliant] (1) for the
       authority-defined axis order. *)
 
+  val name : t -> string option
+  (** The CRS name, e.g. ["WGS 84"] or ["Pulkovo 1942(58) / Stereo70"]. *)
+
+  val authority_code : ?target:string -> t -> string option
+  (** [authority_code srs] is the authority code of the CRS as a string,
+      e.g. [Some "4326"]. [target] selects a sub-node such as ["GEOGCS"];
+      omit it to query the root node. *)
+
+  val is_projected : t -> bool
+  val is_geographic : t -> bool
+
   val destroy : t -> unit
 end
 
@@ -262,7 +273,192 @@ module CoordinateTransformation : sig
     (float * float * float * float, string) result
   (** Transform a bounding box. Returns [(xmin, ymin, xmax, ymax)]. *)
 
+  val transform_points :
+    t -> (float * float) array -> ((float * float) array, string) result
+  (** [transform_points ct pts] transforms a whole [(x, y)] array in a single
+      call. Prefer this over repeated {!transform_point} for vertex lists:
+      one FFI crossing, and GDAL amortises its per-call setup over the
+      batch. *)
+
   val destroy : t -> unit
+end
+
+(** {1 Vector (OGR) operations}
+
+    A dataset opened with {!Vector.open_} exposes layers of features, each
+    feature carrying attribute fields and a geometry.
+
+    {2 Ownership}
+
+    A [layer] is owned by its dataset. A [feature] from {!Vector.Layer.iter},
+    {!Vector.Layer.fold} or {!Vector.Layer.next_feature} is owned by the
+    caller and released by a finaliser (or eagerly by
+    {!Vector.Feature.destroy}; [iter] and [fold] destroy each feature as soon
+    as the callback returns). A [geometry] from {!Vector.Feature.geometry} is
+    {e borrowed} from its feature and must not be used after that feature is
+    destroyed — doing so raises [Invalid_argument] rather than crashing. Use
+    {!Vector.Geometry.clone} to obtain a copy that can outlive the feature. *)
+
+module Vector : sig
+  type geometry_type =
+    | Point
+    | LineString
+    | Polygon
+    | MultiPoint
+    | MultiLineString
+    | MultiPolygon
+    | GeometryCollection
+    | LinearRing
+    | CircularString
+    | CompoundCurve
+    | CurvePolygon
+    | MultiCurve
+    | MultiSurface
+    | PolyhedralSurface
+    | Tin
+    | Triangle
+    | NoGeometry
+    | UnknownGeometry of int
+        (** The flattened (2D) OGR geometry type: the Z/M and 2.5D bits are
+            stripped, so a PolygonZ reads as [Polygon]. *)
+
+  val string_of_geometry_type : geometry_type -> string
+
+  type envelope = {
+    min_x : float;
+    max_x : float;
+    min_y : float;
+    max_y : float;
+  }
+
+  type layer
+  type feature
+  type geometry
+
+  val open_ : ?flags:int -> string -> (dataset, string) result
+  (** Open a vector dataset. The default [flags] are read-only vector access
+      with verbose errors. GDAL's virtual filesystem applies, so
+      ["/vsizip/roi.zip"] opens a zipped shapefile and
+      ["/vsicurl/https://..."] a remote one. *)
+
+  val with_dataset : ?flags:int -> string -> (dataset -> 'a) -> ('a, string) result
+  (** [with_dataset path f] opens [path] as a vector dataset, applies [f],
+      then closes it. *)
+
+  module Geometry : sig
+    val geometry_type : geometry -> geometry_type
+    val sub_count : geometry -> int
+    (** Number of member geometries: the rings of a polygon, the polygons of
+        a multipolygon, [0] for a simple geometry. *)
+
+    val sub : geometry -> int -> geometry option
+    val subs : geometry -> geometry list
+    val point_count : geometry -> int
+    val point : geometry -> int -> float * float
+
+    val points : geometry -> (float * float) array
+    (** All vertices of a vertex-bearing geometry (a point, line string or
+        linear ring), read in one call. Empty for container geometries such
+        as polygons and multipolygons — use {!sub} or {!rings} for those. *)
+
+    val rings : geometry -> (float * float) array list
+    (** Every vertex-bearing leaf of the geometry tree, flattened: for a
+        polygon its exterior and interior rings, for a multipolygon or
+        collection each member's rings, recursively. Leaves with fewer than
+        three vertices are dropped.
+
+        Exterior rings and holes are {e not} distinguished, which is exactly
+        what an even-odd (ray-casting) point-in-polygon test wants: a point
+        inside a hole is enclosed by both the hole ring and the exterior
+        ring, so it counts twice and correctly tests as outside. *)
+
+    val envelope : geometry -> envelope
+    val spatial_reference : geometry -> SpatialReference.t option
+    val is_valid : geometry -> bool
+
+    val transform :
+      geometry -> CoordinateTransformation.t -> (unit, string) result
+    (** Reproject the geometry in place. *)
+
+    val transform_to : geometry -> SpatialReference.t -> (unit, string) result
+    (** Reproject the geometry in place into the given CRS, using the
+        geometry's own CRS as the source. Fails if the geometry has no CRS
+        assigned. *)
+
+    val clone : geometry -> (geometry, string) result
+    (** A deep copy that owns its memory and so may outlive the feature the
+        original was borrowed from. Released by a finaliser, or eagerly by
+        {!destroy}. *)
+
+    val destroy : geometry -> unit
+    (** Release a geometry obtained from {!clone}.
+        @raise Invalid_argument on a geometry borrowed from a feature. *)
+  end
+
+  module Feature : sig
+    val fid : feature -> int64
+    val geometry : feature -> geometry option
+    (** The feature's geometry, borrowed: valid only while the feature is. *)
+
+    val field_count : feature -> int
+    val field_name : feature -> int -> string option
+    val field : feature -> int -> string option
+    (** The field's value as a string, or [None] if unset or null. *)
+
+    val field_by_name : feature -> string -> string option
+    val attributes : feature -> (string * string) list
+    (** All set fields as [(name, value)] pairs. *)
+
+    val destroy : feature -> unit
+    (** Release the feature. Idempotent. *)
+  end
+
+  module Layer : sig
+    val count : dataset -> int
+    (** Number of layers in the dataset. *)
+
+    val get : dataset -> int -> (layer, string) result
+    (** Fetch a layer by 0-based index. *)
+
+    val by_name : dataset -> string -> (layer, string) result
+    val name : layer -> string
+    val geometry_type : layer -> geometry_type
+
+    val feature_count : ?force:bool -> layer -> int
+    (** [feature_count ~force:false] returns [-1] when the driver cannot
+        answer without scanning the whole layer. Defaults to [true]. *)
+
+    val spatial_reference : layer -> SpatialReference.t option
+    (** The layer's CRS, as an owned copy. [None] when the layer declares no
+        CRS (e.g. a shapefile with no [.prj]). *)
+
+    val extent : ?force:bool -> layer -> (envelope, string) result
+
+    val fields : layer -> string list
+    (** Attribute field names, in order. *)
+
+    val set_spatial_filter_rect :
+      layer -> min_x:float -> min_y:float -> max_x:float -> max_y:float -> unit
+    (** Restrict subsequent reads to features intersecting the rectangle, in
+        layer CRS coordinates. *)
+
+    val set_attribute_filter : layer -> string option -> (unit, string) result
+    (** Restrict subsequent reads with an SQL [WHERE] clause, e.g.
+        [Some "NAM_0 = 'Brazil'"]. [None] clears the filter. *)
+
+    val reset_reading : layer -> unit
+    val next_feature : layer -> feature option
+    (** The next feature, owned by the caller. [None] at end of layer. *)
+
+    val fold : layer -> init:'a -> f:('a -> feature -> 'a) -> 'a
+    (** Fold over every feature, from the start of the layer. Each feature is
+        destroyed as soon as [f] returns, so a geometry borrowed from it must
+        not be retained past the callback — {!Geometry.clone} it to keep
+        one. *)
+
+    val iter : layer -> f:(feature -> unit) -> unit
+    (** Like {!fold}, discarding the accumulator. *)
+  end
 end
 
 (** {1 File operations} *)

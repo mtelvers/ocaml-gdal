@@ -462,6 +462,16 @@ module SpatialReference = struct
       t.closed <- true
     end
 
+  (* Adopt an already-created handle that we are responsible for freeing.
+     Not exported: callers outside this file can only obtain a [t] through
+     the importers below, which never hand out a borrowed handle. *)
+  let of_raw_owned raw =
+    Gdal_raw.osr_set_axis_mapping_strategy raw
+      Gdal_raw.oams_traditional_gis_order;
+    let t = { raw; closed = false } in
+    Gc.finalise finalise_srs t;
+    t
+
   let make_srs import_fn =
     let* raw = check_null (Gdal_raw.osr_new_spatial_reference None)
       "Failed to create SpatialReference" in
@@ -469,12 +479,7 @@ module SpatialReference = struct
     | Error msg ->
       Gdal_raw.osr_destroy_spatial_reference raw;
       Error msg
-    | Ok () ->
-      Gdal_raw.osr_set_axis_mapping_strategy raw
-        Gdal_raw.oams_traditional_gis_order;
-      let t = { raw; closed = false } in
-      Gc.finalise finalise_srs t;
-      Ok t
+    | Ok () -> Ok (of_raw_owned raw)
 
   let of_epsg code =
     make_srs (fun raw ->
@@ -500,6 +505,14 @@ module SpatialReference = struct
 
   let set_axis_mapping_strategy (t : t) strategy =
     Gdal_raw.osr_set_axis_mapping_strategy t.raw strategy
+
+  let name (t : t) = Gdal_raw.osr_get_name t.raw
+
+  let authority_code ?target (t : t) =
+    Gdal_raw.osr_get_authority_code t.raw target
+
+  let is_projected (t : t) = Gdal_raw.osr_is_projected t.raw <> 0
+  let is_geographic (t : t) = Gdal_raw.osr_is_geographic t.raw <> 0
 
   let destroy t = finalise_srs t
 end
@@ -566,7 +579,420 @@ module CoordinateTransformation = struct
           Ctypes.CArray.get out_xmax 0,
           Ctypes.CArray.get out_ymax 0 )
 
+  (* Transform a whole vertex array in one FFI call. OCTTransform is
+     variable-cost per point (datum shifts, grid lookups), so batching also
+     lets GDAL amortise its internal setup across the ring. *)
+  let transform_points (ct : t) (pts : (float * float) array) =
+    let n = Array.length pts in
+    if n = 0 then Ok [||]
+    else begin
+      let xs = Ctypes.CArray.make Ctypes.double n in
+      let ys = Ctypes.CArray.make Ctypes.double n in
+      let zs = Ctypes.CArray.make Ctypes.double n in
+      Array.iteri
+        (fun i (x, y) ->
+          Ctypes.CArray.set xs i x;
+          Ctypes.CArray.set ys i y;
+          Ctypes.CArray.set zs i 0.)
+        pts;
+      let ok =
+        Gdal_raw.oct_transform ct.raw n (Ctypes.CArray.start xs)
+          (Ctypes.CArray.start ys) (Ctypes.CArray.start zs)
+      in
+      if ok = 0 then
+        Error
+          (Printf.sprintf "Transform of %d point(s) failed: %s" n
+             (Gdal_raw.cpl_get_last_error_msg ()))
+      else
+        Ok
+          (Array.init n (fun i ->
+               (Ctypes.CArray.get xs i, Ctypes.CArray.get ys i)))
+    end
+
   let destroy ct = finalise_ct ct
+end
+
+(* ---- Vector (OGR) module ---- *)
+
+module Vector = struct
+  type geometry_type =
+    | Point
+    | LineString
+    | Polygon
+    | MultiPoint
+    | MultiLineString
+    | MultiPolygon
+    | GeometryCollection
+    | LinearRing
+    | CircularString
+    | CompoundCurve
+    | CurvePolygon
+    | MultiCurve
+    | MultiSurface
+    | PolyhedralSurface
+    | Tin
+    | Triangle
+    | NoGeometry
+    | UnknownGeometry of int
+
+  let geometry_type_of_int n =
+    (* Strip the Z/M and 2.5D bits so a PolygonZ reads as Polygon. *)
+    match Gdal_raw.ogr_gt_flatten n with
+    | f when f = Gdal_raw.wkb_point -> Point
+    | f when f = Gdal_raw.wkb_line_string -> LineString
+    | f when f = Gdal_raw.wkb_polygon -> Polygon
+    | f when f = Gdal_raw.wkb_multi_point -> MultiPoint
+    | f when f = Gdal_raw.wkb_multi_line_string -> MultiLineString
+    | f when f = Gdal_raw.wkb_multi_polygon -> MultiPolygon
+    | f when f = Gdal_raw.wkb_geometry_collection -> GeometryCollection
+    | f when f = Gdal_raw.wkb_linear_ring -> LinearRing
+    | f when f = Gdal_raw.wkb_circular_string -> CircularString
+    | f when f = Gdal_raw.wkb_compound_curve -> CompoundCurve
+    | f when f = Gdal_raw.wkb_curve_polygon -> CurvePolygon
+    | f when f = Gdal_raw.wkb_multi_curve -> MultiCurve
+    | f when f = Gdal_raw.wkb_multi_surface -> MultiSurface
+    | f when f = Gdal_raw.wkb_polyhedral_surface -> PolyhedralSurface
+    | f when f = Gdal_raw.wkb_tin -> Tin
+    | f when f = Gdal_raw.wkb_triangle -> Triangle
+    | f when f = Gdal_raw.wkb_none -> NoGeometry
+    | f -> UnknownGeometry f
+
+  let string_of_geometry_type = function
+    | Point -> "Point"
+    | LineString -> "LineString"
+    | Polygon -> "Polygon"
+    | MultiPoint -> "MultiPoint"
+    | MultiLineString -> "MultiLineString"
+    | MultiPolygon -> "MultiPolygon"
+    | GeometryCollection -> "GeometryCollection"
+    | LinearRing -> "LinearRing"
+    | CircularString -> "CircularString"
+    | CompoundCurve -> "CompoundCurve"
+    | CurvePolygon -> "CurvePolygon"
+    | MultiCurve -> "MultiCurve"
+    | MultiSurface -> "MultiSurface"
+    | PolyhedralSurface -> "PolyhedralSurface"
+    | Tin -> "TIN"
+    | Triangle -> "Triangle"
+    | NoGeometry -> "None"
+    | UnknownGeometry n -> Gdal_raw.ogr_geometry_type_to_name n
+
+  type envelope = {
+    min_x : float;
+    max_x : float;
+    min_y : float;
+    max_y : float;
+  }
+
+  (* A layer is owned by its dataset; a feature returned by GetNextFeature is
+     owned by us; a geometry from GetGeometryRef is borrowed from its feature
+     and must not outlive it. [keep] is the geometry's owner, held so the GC
+     cannot finalise it while the geometry is still reachable, and consulted
+     by [check_alive] so a use-after-free surfaces as an exception rather
+     than a segfault. *)
+  type layer = { lraw : Gdal_raw.layer_h; _lparent : dataset }
+
+  type feature = {
+    fraw : Gdal_raw.feature_h;
+    mutable fdestroyed : bool;
+  }
+
+  type owned_geometry = {
+    oraw : Gdal_raw.geometry_h;
+    mutable odestroyed : bool;
+  }
+
+  type keep = Keep_feature of feature | Keep_owned of owned_geometry
+
+  type geometry = { graw : Gdal_raw.geometry_h; gkeep : keep }
+
+  let keep_alive = function
+    | Keep_feature f -> not f.fdestroyed
+    | Keep_owned o -> not o.odestroyed
+
+  let check_alive (g : geometry) =
+    if not (keep_alive g.gkeep) then
+      invalid_arg
+        "Gdal.Vector: geometry used after its owning feature/geometry was \
+         destroyed"
+
+  let envelope_of_struct s =
+    {
+      min_x = Ctypes.getf s Gdal_raw.env_min_x;
+      max_x = Ctypes.getf s Gdal_raw.env_max_x;
+      min_y = Ctypes.getf s Gdal_raw.env_min_y;
+      max_y = Ctypes.getf s Gdal_raw.env_max_y;
+    }
+
+  let default_open_flags =
+    Gdal_raw.gdal_of_readonly lor Gdal_raw.gdal_of_vector
+    lor Gdal_raw.gdal_of_verbose_error
+
+  let open_ ?(flags = default_open_flags) path =
+    let* raw = check_null (Gdal_raw.open_ex path flags None None None)
+      ("Failed to open vector dataset " ^ path) in
+    wrap_dataset raw
+
+  let with_dataset ?flags path f =
+    let* ds = open_ ?flags path in
+    Ok (Fun.protect ~finally:(fun () -> Dataset.close ds) (fun () -> f ds))
+
+  module Geometry = struct
+    let geometry_type (g : geometry) =
+      check_alive g;
+      geometry_type_of_int (Gdal_raw.ogr_g_get_geometry_type g.graw)
+
+    let sub_count (g : geometry) =
+      check_alive g;
+      Gdal_raw.ogr_g_get_geometry_count g.graw
+
+    let sub (g : geometry) i =
+      check_alive g;
+      let raw = Gdal_raw.ogr_g_get_geometry_ref g.graw i in
+      if Ctypes.is_null raw then None
+      else Some { graw = raw; gkeep = g.gkeep }
+
+    let subs g = List.init (sub_count g) (fun i -> sub g i) |> List.filter_map Fun.id
+
+    let point_count (g : geometry) =
+      check_alive g;
+      Gdal_raw.ogr_g_get_point_count g.graw
+
+    let point (g : geometry) i =
+      check_alive g;
+      (Gdal_raw.ogr_g_get_x g.graw i, Gdal_raw.ogr_g_get_y g.graw i)
+
+    (* One FFI call for the whole vertex list; per-vertex OGR_G_GetX/GetY is
+       roughly an order of magnitude slower on the million-vertex rings that
+       administrative boundary layers contain. *)
+    let points (g : geometry) =
+      check_alive g;
+      let n = Gdal_raw.ogr_g_get_point_count g.graw in
+      if n = 0 then [||]
+      else begin
+        let xs = Ctypes.CArray.make Ctypes.double n in
+        let ys = Ctypes.CArray.make Ctypes.double n in
+        let stride = Ctypes.sizeof Ctypes.double in
+        let got =
+          Gdal_raw.ogr_g_get_points g.graw
+            (Ctypes.to_voidp (Ctypes.CArray.start xs))
+            stride
+            (Ctypes.to_voidp (Ctypes.CArray.start ys))
+            stride Ctypes.null 0
+        in
+        Array.init got (fun i ->
+            (Ctypes.CArray.get xs i, Ctypes.CArray.get ys i))
+      end
+
+    (* Every vertex-bearing leaf of the geometry tree, as closed vertex
+       lists. Polygon -> its exterior and interior LinearRings;
+       MultiPolygon / GeometryCollection -> recursively each member's rings.
+       Rings are returned flat, with no exterior/hole distinction: an
+       even-odd (ray-casting) point-in-polygon test over the flat list gives
+       the same answer as testing exterior-minus-holes, because a point
+       inside a hole is enclosed by both the hole ring and its exterior.
+       Leaves with fewer than 3 vertices bound no area and are dropped. *)
+    let rings g =
+      let acc = ref [] in
+      let rec walk g =
+        let n = sub_count g in
+        if n > 0 then
+          for i = 0 to n - 1 do
+            match sub g i with Some s -> walk s | None -> ()
+          done
+        else
+          let p = points g in
+          if Array.length p >= 3 then acc := p :: !acc
+      in
+      walk g;
+      List.rev !acc
+
+    let envelope (g : geometry) =
+      check_alive g;
+      let e = Ctypes.make Gdal_raw.ogr_envelope in
+      Gdal_raw.ogr_g_get_envelope g.graw (Ctypes.addr e);
+      envelope_of_struct e
+
+    let spatial_reference (g : geometry) =
+      check_alive g;
+      let raw = Gdal_raw.ogr_g_get_spatial_reference g.graw in
+      if Ctypes.is_null raw then None
+      else
+        let c = Gdal_raw.osr_clone raw in
+        if Ctypes.is_null c then None
+        else Some (SpatialReference.of_raw_owned c)
+
+    let is_valid (g : geometry) =
+      check_alive g;
+      Gdal_raw.ogr_g_is_valid g.graw <> 0
+
+    let transform (g : geometry) (ct : CoordinateTransformation.t) =
+      check_alive g;
+      check_ogr_err (Gdal_raw.ogr_g_transform g.graw ct.CoordinateTransformation.raw)
+
+    let transform_to (g : geometry) (srs : SpatialReference.t) =
+      check_alive g;
+      check_ogr_err
+        (Gdal_raw.ogr_g_transform_to g.graw srs.SpatialReference.raw)
+
+    let finalise_owned (o : owned_geometry) =
+      if not o.odestroyed then begin
+        Gdal_raw.ogr_g_destroy_geometry o.oraw;
+        o.odestroyed <- true
+      end
+
+    (* A deep copy that owns its memory, so it can outlive the feature it
+       came from. Released by a finaliser, or eagerly by [destroy]. *)
+    let clone (g : geometry) =
+      check_alive g;
+      let* raw = check_null (Gdal_raw.ogr_g_clone g.graw) "OGR_G_Clone failed" in
+      let o = { oraw = raw; odestroyed = false } in
+      Gc.finalise finalise_owned o;
+      Ok { graw = raw; gkeep = Keep_owned o }
+
+    let destroy (g : geometry) =
+      match g.gkeep with
+      | Keep_owned o -> finalise_owned o
+      | Keep_feature _ ->
+        invalid_arg
+          "Gdal.Vector.Geometry.destroy: geometry is borrowed from a feature; \
+           destroy the feature instead"
+  end
+
+  module Feature = struct
+    let finalise_feature (f : feature) =
+      if not f.fdestroyed then begin
+        Gdal_raw.ogr_f_destroy f.fraw;
+        f.fdestroyed <- true
+      end
+
+    let wrap raw =
+      let f = { fraw = raw; fdestroyed = false } in
+      Gc.finalise finalise_feature f;
+      f
+
+    let destroy f = finalise_feature f
+
+    let fid (f : feature) = Gdal_raw.ogr_f_get_fid f.fraw
+
+    let geometry (f : feature) =
+      if f.fdestroyed then None
+      else
+        let raw = Gdal_raw.ogr_f_get_geometry_ref f.fraw in
+        if Ctypes.is_null raw then None
+        else Some { graw = raw; gkeep = Keep_feature f }
+
+    let field_count (f : feature) = Gdal_raw.ogr_f_get_field_count f.fraw
+
+    let field_name (f : feature) i =
+      let defn = Gdal_raw.ogr_f_get_defn_ref f.fraw in
+      if Ctypes.is_null defn then None
+      else
+        let fld = Gdal_raw.ogr_fd_get_field_defn defn i in
+        if Ctypes.is_null fld then None
+        else Some (Gdal_raw.ogr_fld_get_name_ref fld)
+
+    let field (f : feature) i =
+      if Gdal_raw.ogr_f_is_field_set_and_not_null f.fraw i = 0 then None
+      else Some (Gdal_raw.ogr_f_get_field_as_string f.fraw i)
+
+    let field_by_name (f : feature) name =
+      let i = Gdal_raw.ogr_f_get_field_index f.fraw name in
+      if i < 0 then None else field f i
+
+    let attributes (f : feature) =
+      List.init (field_count f) (fun i ->
+          match field_name f i with
+          | None -> None
+          | Some n -> Some (n, Option.value (field f i) ~default:""))
+      |> List.filter_map Fun.id
+  end
+
+  module Layer = struct
+    let count (ds : dataset) = Gdal_raw.dataset_get_layer_count ds.raw
+
+    let get (ds : dataset) i =
+      let* raw = check_null (Gdal_raw.dataset_get_layer ds.raw i)
+        (Printf.sprintf "Layer %d not found" i) in
+      Ok ({ lraw = raw; _lparent = ds } : layer)
+
+    let by_name (ds : dataset) name =
+      let* raw = check_null (Gdal_raw.dataset_get_layer_by_name ds.raw name)
+        ("Layer not found: " ^ name) in
+      Ok ({ lraw = raw; _lparent = ds } : layer)
+
+    let name (l : layer) = Gdal_raw.ogr_l_get_name l.lraw
+
+    let geometry_type (l : layer) =
+      geometry_type_of_int (Gdal_raw.ogr_l_get_geom_type l.lraw)
+
+    (* [force:false] returns -1 when the driver cannot answer without a full
+       scan of the layer. *)
+    let feature_count ?(force = true) (l : layer) =
+      Int64.to_int
+        (Gdal_raw.ogr_l_get_feature_count l.lraw (if force then 1 else 0))
+
+    let spatial_reference (l : layer) =
+      let raw = Gdal_raw.ogr_l_get_spatial_ref l.lraw in
+      if Ctypes.is_null raw then None
+      else
+        (* The layer owns its SRS, so hand back an owned clone rather than
+           a borrowed handle our finaliser would wrongly free. *)
+        let c = Gdal_raw.osr_clone raw in
+        if Ctypes.is_null c then None
+        else Some (SpatialReference.of_raw_owned c)
+
+    let extent ?(force = true) (l : layer) =
+      let e = Ctypes.make Gdal_raw.ogr_envelope in
+      let* () =
+        check_ogr_err
+          (Gdal_raw.ogr_l_get_extent l.lraw (Ctypes.addr e)
+             (if force then 1 else 0))
+      in
+      Ok (envelope_of_struct e)
+
+    let fields (l : layer) =
+      let defn = Gdal_raw.ogr_l_get_layer_defn l.lraw in
+      if Ctypes.is_null defn then []
+      else
+        List.init (Gdal_raw.ogr_fd_get_field_count defn) (fun i ->
+            let fld = Gdal_raw.ogr_fd_get_field_defn defn i in
+            if Ctypes.is_null fld then None
+            else Some (Gdal_raw.ogr_fld_get_name_ref fld))
+        |> List.filter_map Fun.id
+
+    let set_spatial_filter_rect (l : layer) ~min_x ~min_y ~max_x ~max_y =
+      Gdal_raw.ogr_l_set_spatial_filter_rect l.lraw min_x min_y max_x max_y
+
+    let set_attribute_filter (l : layer) where =
+      check_ogr_err (Gdal_raw.ogr_l_set_attribute_filter l.lraw where)
+
+    let reset_reading (l : layer) = Gdal_raw.ogr_l_reset_reading l.lraw
+
+    let next_feature (l : layer) =
+      let raw = Gdal_raw.ogr_l_get_next_feature l.lraw in
+      if Ctypes.is_null raw then None else Some (Feature.wrap raw)
+
+    (* Each feature is destroyed as soon as [f] returns, so a geometry
+       borrowed from it must not be retained past the callback — use
+       [Geometry.clone] to keep one. *)
+    let fold (l : layer) ~init ~f =
+      reset_reading l;
+      let rec loop acc =
+        match next_feature l with
+        | None -> acc
+        | Some feat ->
+          let acc =
+            Fun.protect
+              ~finally:(fun () -> Feature.destroy feat)
+              (fun () -> f acc feat)
+          in
+          loop acc
+      in
+      loop init
+
+    let iter (l : layer) ~f = fold l ~init:() ~f:(fun () feat -> f feat)
+  end
 end
 
 (** {1 File operations} *)

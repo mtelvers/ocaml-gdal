@@ -279,3 +279,225 @@ let get_driver_long_name =
 let cpl_copy_file =
   foreign ~from:libgdal ~release_runtime_lock:true "CPLCopyFile"
     (string @-> string @-> returning int)
+
+(* ---- OGR vector API ---- *)
+
+type layer_h = unit ptr
+let layer_h : layer_h typ = ptr void
+
+type feature_h = unit ptr
+let feature_h : feature_h typ = ptr void
+
+type geometry_h = unit ptr
+let geometry_h : geometry_h typ = ptr void
+
+type feature_defn_h = unit ptr
+let feature_defn_h : feature_defn_h typ = ptr void
+
+type field_defn_h = unit ptr
+let field_defn_h : field_defn_h typ = ptr void
+
+(* OGRwkbGeometryType enum (flattened 2D values; OGR_GT_Flatten strips the
+   Z/M and 2.5D bits before we match on these). *)
+let wkb_unknown = 0
+let wkb_point = 1
+let wkb_line_string = 2
+let wkb_polygon = 3
+let wkb_multi_point = 4
+let wkb_multi_line_string = 5
+let wkb_multi_polygon = 6
+let wkb_geometry_collection = 7
+let wkb_circular_string = 8
+let wkb_compound_curve = 9
+let wkb_curve_polygon = 10
+let wkb_multi_curve = 11
+let wkb_multi_surface = 12
+let wkb_curve = 13
+let wkb_surface = 14
+let wkb_polyhedral_surface = 15
+let wkb_tin = 16
+let wkb_triangle = 17
+let wkb_none = 100
+let wkb_linear_ring = 101
+
+(* OGREnvelope: { double MinX; double MaxX; double MinY; double MaxY; } *)
+type ogr_envelope
+
+let ogr_envelope : ogr_envelope structure typ = structure "OGREnvelope"
+let env_min_x = field ogr_envelope "MinX" double
+let env_max_x = field ogr_envelope "MaxX" double
+let env_min_y = field ogr_envelope "MinY" double
+let env_max_y = field ogr_envelope "MaxY" double
+let () = seal ogr_envelope
+
+(* Layer access off a dataset opened with gdal_of_vector *)
+let dataset_get_layer_count =
+  foreign ~from:libgdal "GDALDatasetGetLayerCount" (dataset_h @-> returning int)
+
+let dataset_get_layer =
+  foreign ~from:libgdal "GDALDatasetGetLayer"
+    (dataset_h @-> int @-> returning layer_h)
+
+let dataset_get_layer_by_name =
+  foreign ~from:libgdal "GDALDatasetGetLayerByName"
+    (dataset_h @-> string @-> returning layer_h)
+
+(* Layer *)
+let ogr_l_get_name =
+  foreign ~from:libgdal "OGR_L_GetName" (layer_h @-> returning string)
+
+let ogr_l_get_geom_type =
+  foreign ~from:libgdal "OGR_L_GetGeomType" (layer_h @-> returning int)
+
+let ogr_l_get_feature_count =
+  foreign ~from:libgdal "OGR_L_GetFeatureCount"
+    (layer_h @-> int @-> returning int64_t)
+
+let ogr_l_reset_reading =
+  foreign ~from:libgdal "OGR_L_ResetReading" (layer_h @-> returning void)
+
+let ogr_l_get_next_feature =
+  foreign ~from:libgdal ~release_runtime_lock:true "OGR_L_GetNextFeature"
+    (layer_h @-> returning feature_h)
+
+let ogr_l_get_spatial_ref =
+  foreign ~from:libgdal "OGR_L_GetSpatialRef"
+    (layer_h @-> returning spatial_reference_h)
+
+let ogr_l_get_extent =
+  foreign ~from:libgdal ~release_runtime_lock:true "OGR_L_GetExtent"
+    (layer_h @-> ptr ogr_envelope @-> int @-> returning int)
+
+let ogr_l_get_layer_defn =
+  foreign ~from:libgdal "OGR_L_GetLayerDefn"
+    (layer_h @-> returning feature_defn_h)
+
+let ogr_l_set_spatial_filter_rect =
+  foreign ~from:libgdal "OGR_L_SetSpatialFilterRect"
+    (layer_h @-> double @-> double @-> double @-> double @-> returning void)
+
+let ogr_l_set_attribute_filter =
+  foreign ~from:libgdal "OGR_L_SetAttributeFilter"
+    (layer_h @-> string_opt @-> returning int)
+
+(* Feature definition / field definition *)
+let ogr_fd_get_field_count =
+  foreign ~from:libgdal "OGR_FD_GetFieldCount"
+    (feature_defn_h @-> returning int)
+
+let ogr_fd_get_field_defn =
+  foreign ~from:libgdal "OGR_FD_GetFieldDefn"
+    (feature_defn_h @-> int @-> returning field_defn_h)
+
+let ogr_fld_get_name_ref =
+  foreign ~from:libgdal "OGR_Fld_GetNameRef" (field_defn_h @-> returning string)
+
+(* Feature *)
+let ogr_f_destroy =
+  foreign ~from:libgdal "OGR_F_Destroy" (feature_h @-> returning void)
+
+let ogr_f_get_geometry_ref =
+  foreign ~from:libgdal "OGR_F_GetGeometryRef"
+    (feature_h @-> returning geometry_h)
+
+let ogr_f_get_defn_ref =
+  foreign ~from:libgdal "OGR_F_GetDefnRef"
+    (feature_h @-> returning feature_defn_h)
+
+let ogr_f_get_fid =
+  foreign ~from:libgdal "OGR_F_GetFID" (feature_h @-> returning int64_t)
+
+let ogr_f_get_field_count =
+  foreign ~from:libgdal "OGR_F_GetFieldCount" (feature_h @-> returning int)
+
+let ogr_f_get_field_index =
+  foreign ~from:libgdal "OGR_F_GetFieldIndex"
+    (feature_h @-> string @-> returning int)
+
+let ogr_f_get_field_as_string =
+  foreign ~from:libgdal "OGR_F_GetFieldAsString"
+    (feature_h @-> int @-> returning string)
+
+let ogr_f_is_field_set_and_not_null =
+  foreign ~from:libgdal "OGR_F_IsFieldSetAndNotNull"
+    (feature_h @-> int @-> returning int)
+
+(* Geometry *)
+let ogr_g_get_geometry_type =
+  foreign ~from:libgdal "OGR_G_GetGeometryType" (geometry_h @-> returning int)
+
+let ogr_gt_flatten =
+  foreign ~from:libgdal "OGR_GT_Flatten" (int @-> returning int)
+
+let ogr_geometry_type_to_name =
+  foreign ~from:libgdal "OGRGeometryTypeToName" (int @-> returning string)
+
+let ogr_g_get_geometry_count =
+  foreign ~from:libgdal "OGR_G_GetGeometryCount" (geometry_h @-> returning int)
+
+let ogr_g_get_geometry_ref =
+  foreign ~from:libgdal "OGR_G_GetGeometryRef"
+    (geometry_h @-> int @-> returning geometry_h)
+
+let ogr_g_get_point_count =
+  foreign ~from:libgdal "OGR_G_GetPointCount" (geometry_h @-> returning int)
+
+let ogr_g_get_x =
+  foreign ~from:libgdal "OGR_G_GetX" (geometry_h @-> int @-> returning double)
+
+let ogr_g_get_y =
+  foreign ~from:libgdal "OGR_G_GetY" (geometry_h @-> int @-> returning double)
+
+(* Bulk vertex read: fills strided X/Y/Z buffers, returns the point count.
+   Reading a large ring one OGR_G_GetX/GetY FFI call per vertex is an order
+   of magnitude slower. *)
+let ogr_g_get_points =
+  foreign ~from:libgdal ~release_runtime_lock:true "OGR_G_GetPoints"
+    (geometry_h @-> ptr void @-> int @-> ptr void @-> int @-> ptr void @-> int
+    @-> returning int)
+
+let ogr_g_get_envelope =
+  foreign ~from:libgdal "OGR_G_GetEnvelope"
+    (geometry_h @-> ptr ogr_envelope @-> returning void)
+
+let ogr_g_get_spatial_reference =
+  foreign ~from:libgdal "OGR_G_GetSpatialReference"
+    (geometry_h @-> returning spatial_reference_h)
+
+let ogr_g_transform =
+  foreign ~from:libgdal ~release_runtime_lock:true "OGR_G_Transform"
+    (geometry_h @-> coordinate_transformation_h @-> returning int)
+
+let ogr_g_transform_to =
+  foreign ~from:libgdal ~release_runtime_lock:true "OGR_G_TransformTo"
+    (geometry_h @-> spatial_reference_h @-> returning int)
+
+let ogr_g_clone =
+  foreign ~from:libgdal "OGR_G_Clone" (geometry_h @-> returning geometry_h)
+
+let ogr_g_destroy_geometry =
+  foreign ~from:libgdal "OGR_G_DestroyGeometry" (geometry_h @-> returning void)
+
+let ogr_g_is_valid =
+  foreign ~from:libgdal ~release_runtime_lock:true "OGR_G_IsValid"
+    (geometry_h @-> returning int)
+
+(* Spatial reference extras needed to hand out an owned copy of a layer's
+   borrowed SRS. *)
+let osr_clone =
+  foreign ~from:libgdal "OSRClone"
+    (spatial_reference_h @-> returning spatial_reference_h)
+
+let osr_get_name =
+  foreign ~from:libgdal "OSRGetName"
+    (spatial_reference_h @-> returning string_opt)
+
+let osr_get_authority_code =
+  foreign ~from:libgdal "OSRGetAuthorityCode"
+    (spatial_reference_h @-> string_opt @-> returning string_opt)
+
+let osr_is_projected =
+  foreign ~from:libgdal "OSRIsProjected" (spatial_reference_h @-> returning int)
+
+let osr_is_geographic =
+  foreign ~from:libgdal "OSRIsGeographic" (spatial_reference_h @-> returning int)

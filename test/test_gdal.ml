@@ -808,7 +808,336 @@ let python_tests = [
   Alcotest.test_case "band metadata" `Quick test_python_band_metadata;
 ]
 
-(* ---- Run ---- *)
+(* ---- Vector (OGR) ---- *)
+
+module V = Gdal.Vector
+
+let write_file path contents =
+  let oc = open_out path in
+  Fun.protect ~finally:(fun () -> close_out oc) (fun () ->
+    output_string oc contents)
+
+(* A square with a square hole, plus a two-part multipolygon. GeoJSON with no
+   "crs" member is CRS84, so the layer comes back as WGS 84. *)
+let geojson_fixture = {|{
+  "type": "FeatureCollection",
+  "features": [
+    { "type": "Feature",
+      "properties": { "name": "holed", "code": "A1" },
+      "geometry": { "type": "Polygon", "coordinates": [
+        [[0,0],[10,0],[10,10],[0,10],[0,0]],
+        [[4,4],[6,4],[6,6],[4,6],[4,4]]] } },
+    { "type": "Feature",
+      "properties": { "name": "pair", "code": "B2" },
+      "geometry": { "type": "MultiPolygon", "coordinates": [
+        [[[20,0],[21,0],[21,1],[20,1],[20,0]]],
+        [[[30,0],[31,0],[31,1],[30,1],[30,0]]]] } }
+  ]
+}|}
+
+let fixture_path = tmp "vector.geojson"
+
+let with_fixture_layer f =
+  write_file fixture_path geojson_fixture;
+  unwrap "open vector"
+    (V.with_dataset fixture_path (fun ds ->
+       let layer = unwrap "layer" (V.Layer.get ds 0) in
+       f layer))
+
+(* The nth feature of the layer, as a list of its rings. Features are
+   destroyed by [fold], so the rings are copied out rather than the
+   geometry retained. *)
+let rings_of_feature n =
+  with_fixture_layer (fun layer ->
+    let _, rings =
+      V.Layer.fold layer ~init:(0, []) ~f:(fun (i, acc) feat ->
+        if i <> n then (i + 1, acc)
+        else
+          match V.Feature.geometry feat with
+          | None -> Alcotest.fail "feature has no geometry"
+          | Some g -> (i + 1, V.Geometry.rings g))
+    in
+    rings)
+
+let test_vector_layers () =
+  with_fixture_layer (fun layer ->
+    (* The GeoJSON driver names the layer after the file. *)
+    Alcotest.(check string) "layer name"
+      (Filename.remove_extension (Filename.basename fixture_path))
+      (V.Layer.name layer);
+    Alcotest.(check int) "feature count" 2 (V.Layer.feature_count layer);
+    Alcotest.(check (list string)) "fields" [ "name"; "code" ]
+      (V.Layer.fields layer))
+
+let test_vector_layer_count () =
+  write_file fixture_path geojson_fixture;
+  unwrap "count"
+    (V.with_dataset fixture_path (fun ds ->
+       Alcotest.(check int) "one layer" 1 (V.Layer.count ds);
+       expect_error (V.Layer.get ds 5)))
+
+let test_vector_geometry_types () =
+  with_fixture_layer (fun layer ->
+    let types =
+      V.Layer.fold layer ~init:[] ~f:(fun acc feat ->
+        match V.Feature.geometry feat with
+        | None -> acc
+        | Some g -> V.Geometry.geometry_type g :: acc)
+      |> List.rev
+    in
+    Alcotest.(check (list string)) "geometry types"
+      [ "Polygon"; "MultiPolygon" ]
+      (List.map V.string_of_geometry_type types))
+
+let test_vector_attributes () =
+  with_fixture_layer (fun layer ->
+    let names =
+      V.Layer.fold layer ~init:[] ~f:(fun acc feat ->
+        V.Feature.field_by_name feat "name" :: acc)
+      |> List.rev |> List.filter_map Fun.id
+    in
+    Alcotest.(check (list string)) "name field" [ "holed"; "pair" ] names;
+    let attrs =
+      V.Layer.fold layer ~init:[] ~f:(fun acc feat ->
+        if acc <> [] then acc else V.Feature.attributes feat)
+    in
+    Alcotest.(check (list (pair string string))) "attributes"
+      [ ("name", "holed"); ("code", "A1") ]
+      attrs)
+
+(* A polygon's exterior and interior rings both come back from [rings], with
+   no hole distinction — that flat list is what an even-odd point-in-polygon
+   test consumes. *)
+let test_vector_rings_polygon_with_hole () =
+  let rings = rings_of_feature 0 in
+  Alcotest.(check int) "exterior + hole" 2 (List.length rings);
+  Alcotest.(check (list int)) "vertices per ring" [ 5; 5 ]
+    (List.map Array.length rings);
+  match rings with
+  | exterior :: _ ->
+    let x, y = exterior.(0) in
+    Alcotest.check float_eps "first x" 0.0 x;
+    Alcotest.check float_eps "first y" 0.0 y;
+    let x2, y2 = exterior.(2) in
+    Alcotest.check float_eps "third x" 10.0 x2;
+    Alcotest.check float_eps "third y" 10.0 y2
+  | [] -> Alcotest.fail "no rings"
+
+let test_vector_rings_multipolygon () =
+  let rings = rings_of_feature 1 in
+  Alcotest.(check int) "two parts" 2 (List.length rings);
+  Alcotest.(check (list int)) "vertices per ring" [ 5; 5 ]
+    (List.map Array.length rings)
+
+(* A container geometry has no vertices of its own: the vertices live on the
+   LinearRing children. *)
+let test_vector_container_has_no_points () =
+  with_fixture_layer (fun layer ->
+    V.Layer.reset_reading layer;
+    match V.Layer.next_feature layer with
+    | None -> Alcotest.fail "no feature"
+    | Some feat ->
+      let g = Option.get (V.Feature.geometry feat) in
+      Alcotest.(check int) "polygon point_count" 0 (V.Geometry.point_count g);
+      Alcotest.(check int) "polygon sub_count" 2 (V.Geometry.sub_count g);
+      let ring = Option.get (V.Geometry.sub g 0) in
+      (* OGRLinearRing reports itself as wkbLineString for WKB
+         compatibility, so [LinearRing] is a type the enum can express but
+         geometries in the wild rarely report. *)
+      Alcotest.(check string) "ring type" "LineString"
+        (V.string_of_geometry_type (V.Geometry.geometry_type ring));
+      Alcotest.(check int) "ring point_count" 5 (V.Geometry.point_count ring);
+      Alcotest.(check int) "points array" 5
+        (Array.length (V.Geometry.points ring));
+      let px, py = V.Geometry.point ring 1 in
+      Alcotest.check float_eps "point 1 x" 10.0 px;
+      Alcotest.check float_eps "point 1 y" 0.0 py;
+      V.Feature.destroy feat)
+
+let test_vector_envelopes () =
+  with_fixture_layer (fun layer ->
+    let e = unwrap "extent" (V.Layer.extent layer) in
+    Alcotest.check float_eps "extent min_x" 0.0 e.V.min_x;
+    Alcotest.check float_eps "extent max_x" 31.0 e.V.max_x;
+    Alcotest.check float_eps "extent min_y" 0.0 e.V.min_y;
+    Alcotest.check float_eps "extent max_y" 10.0 e.V.max_y;
+    V.Layer.reset_reading layer;
+    let feat = Option.get (V.Layer.next_feature layer) in
+    let g = Option.get (V.Feature.geometry feat) in
+    let ge = V.Geometry.envelope g in
+    Alcotest.check float_eps "geom max_x" 10.0 ge.V.max_x;
+    Alcotest.check float_eps "geom max_y" 10.0 ge.V.max_y;
+    V.Feature.destroy feat)
+
+let test_vector_spatial_reference () =
+  with_fixture_layer (fun layer ->
+    match V.Layer.spatial_reference layer with
+    | None -> Alcotest.fail "layer has no SRS"
+    | Some srs ->
+      Alcotest.(check bool) "geographic" true
+        (Gdal.SpatialReference.is_geographic srs);
+      Alcotest.(check bool) "not projected" false
+        (Gdal.SpatialReference.is_projected srs);
+      Alcotest.(check (option string)) "authority code" (Some "4326")
+        (Gdal.SpatialReference.authority_code srs);
+      Alcotest.(check (option string)) "name" (Some "WGS 84")
+        (Gdal.SpatialReference.name srs))
+
+let test_vector_spatial_filter () =
+  with_fixture_layer (fun layer ->
+    V.Layer.set_spatial_filter_rect layer ~min_x:29.0 ~min_y:(-1.0) ~max_x:32.0
+      ~max_y:2.0;
+    Alcotest.(check int) "filtered count" 1 (V.Layer.feature_count layer);
+    V.Layer.set_spatial_filter_rect layer ~min_x:(-180.) ~min_y:(-90.)
+      ~max_x:180. ~max_y:90.;
+    Alcotest.(check int) "unfiltered count" 2 (V.Layer.feature_count layer))
+
+let test_vector_attribute_filter () =
+  with_fixture_layer (fun layer ->
+    unwrap "filter" (V.Layer.set_attribute_filter layer (Some "code = 'B2'"));
+    Alcotest.(check int) "filtered count" 1 (V.Layer.feature_count layer);
+    unwrap "clear" (V.Layer.set_attribute_filter layer None);
+    Alcotest.(check int) "cleared count" 2 (V.Layer.feature_count layer))
+
+(* Reprojecting in place: the 10,10 corner should land on its Mercator
+   position, cross-checked against the closed-form helpers above. *)
+let test_vector_transform_to () =
+  with_fixture_layer (fun layer ->
+    V.Layer.reset_reading layer;
+    let feat = Option.get (V.Layer.next_feature layer) in
+    let g = Option.get (V.Feature.geometry feat) in
+    let dst = unwrap "3857" (Gdal.SpatialReference.of_epsg 3857) in
+    unwrap "transform_to" (V.Geometry.transform_to g dst);
+    let ring = Option.get (V.Geometry.sub g 0) in
+    let pts = V.Geometry.points ring in
+    let x, y = pts.(2) in
+    let eps = Alcotest.float 0.5 in
+    Alcotest.check eps "mercator x" (mercator_x 10.0) x;
+    Alcotest.check eps "mercator y" (mercator_y 10.0) y;
+    V.Feature.destroy feat)
+
+let test_vector_transform_points_bulk () =
+  with_4326_to_3857 (fun ct ->
+    let pts = [| (0.0, 0.0); (10.0, 10.0); (-30.0, 45.0) |] in
+    let out = unwrap "bulk" (Gdal.CoordinateTransformation.transform_points ct pts) in
+    Alcotest.(check int) "same length" 3 (Array.length out);
+    let eps = Alcotest.float 0.5 in
+    Array.iteri
+      (fun i (lon, lat) ->
+        let x, y = out.(i) in
+        Alcotest.check eps "bulk x" (mercator_x lon) x;
+        Alcotest.check eps "bulk y" (mercator_y lat) y)
+      pts;
+    Alcotest.(check int) "empty input" 0
+      (Array.length (unwrap "empty" (Gdal.CoordinateTransformation.transform_points ct [||]))))
+
+(* A clone owns its memory, so it stays usable after the feature it came
+   from is gone. *)
+let test_vector_clone_outlives_feature () =
+  let cloned =
+    with_fixture_layer (fun layer ->
+      V.Layer.reset_reading layer;
+      let feat = Option.get (V.Layer.next_feature layer) in
+      let g = Option.get (V.Feature.geometry feat) in
+      let c = unwrap "clone" (V.Geometry.clone g) in
+      V.Feature.destroy feat;
+      c)
+  in
+  Alcotest.(check int) "clone still has rings" 2
+    (List.length (V.Geometry.rings cloned));
+  V.Geometry.destroy cloned
+
+let borrowed_error =
+  Invalid_argument
+    "Gdal.Vector: geometry used after its owning feature/geometry was destroyed"
+
+let test_vector_use_after_destroy () =
+  with_fixture_layer (fun layer ->
+    V.Layer.reset_reading layer;
+    let feat = Option.get (V.Layer.next_feature layer) in
+    let g = Option.get (V.Feature.geometry feat) in
+    V.Feature.destroy feat;
+    Alcotest.check_raises "point_count after destroy" borrowed_error (fun () ->
+      ignore (V.Geometry.point_count g));
+    Alcotest.check_raises "rings after destroy" borrowed_error (fun () ->
+      ignore (V.Geometry.rings g)))
+
+let test_vector_destroy_borrowed_refused () =
+  with_fixture_layer (fun layer ->
+    V.Layer.reset_reading layer;
+    let feat = Option.get (V.Layer.next_feature layer) in
+    let g = Option.get (V.Feature.geometry feat) in
+    Alcotest.check_raises "destroy borrowed"
+      (Invalid_argument
+         "Gdal.Vector.Geometry.destroy: geometry is borrowed from a feature; \
+          destroy the feature instead")
+      (fun () -> V.Geometry.destroy g);
+    V.Feature.destroy feat)
+
+let test_vector_open_missing () =
+  expect_error (V.open_ (tmp "no_such_vector.geojson"))
+
+let vector_tests = [
+  Alcotest.test_case "layers" `Quick test_vector_layers;
+  Alcotest.test_case "layer count" `Quick test_vector_layer_count;
+  Alcotest.test_case "geometry types" `Quick test_vector_geometry_types;
+  Alcotest.test_case "attributes" `Quick test_vector_attributes;
+  Alcotest.test_case "rings of polygon with hole" `Quick
+    test_vector_rings_polygon_with_hole;
+  Alcotest.test_case "rings of multipolygon" `Quick
+    test_vector_rings_multipolygon;
+  Alcotest.test_case "container has no points" `Quick
+    test_vector_container_has_no_points;
+  Alcotest.test_case "envelopes" `Quick test_vector_envelopes;
+  Alcotest.test_case "spatial reference" `Quick test_vector_spatial_reference;
+  Alcotest.test_case "spatial filter" `Quick test_vector_spatial_filter;
+  Alcotest.test_case "attribute filter" `Quick test_vector_attribute_filter;
+  Alcotest.test_case "transform_to" `Quick test_vector_transform_to;
+  Alcotest.test_case "transform_points" `Quick test_vector_transform_points_bulk;
+  Alcotest.test_case "clone outlives feature" `Quick
+    test_vector_clone_outlives_feature;
+  Alcotest.test_case "use after destroy raises" `Quick
+    test_vector_use_after_destroy;
+  Alcotest.test_case "destroy borrowed refused" `Quick
+    test_vector_destroy_borrowed_refused;
+  Alcotest.test_case "open missing" `Quick test_vector_open_missing;
+]
+
+(* Cross-check ring extraction against python's OGR bindings on the same
+   fixture. *)
+let test_python_vector_rings () =
+  skip_without_python ();
+  write_file fixture_path geojson_fixture;
+  let py_output = run_python (Printf.sprintf {|
+from osgeo import ogr
+ds = ogr.Open("%s")
+layer = ds.GetLayer(0)
+counts = []
+for feat in layer:
+    g = feat.GetGeometryRef()
+    stack = [g]
+    while stack:
+        cur = stack.pop(0)
+        n = cur.GetGeometryCount()
+        if n > 0:
+            stack = [cur.GetGeometryRef(i) for i in range(n)] + stack
+        elif cur.GetPointCount() >= 3:
+            counts.append(cur.GetPointCount())
+print(",".join(str(c) for c in counts))
+|} fixture_path)
+  in
+  let py_counts =
+    String.split_on_char ',' py_output
+    |> List.map (fun s -> int_of_string (String.trim s))
+  in
+  let ml_counts =
+    List.map Array.length (rings_of_feature 0 @ rings_of_feature 1)
+  in
+  Alcotest.(check (list int)) "ring vertex counts" py_counts ml_counts
+
+let python_vector_tests = [
+  Alcotest.test_case "vector rings" `Quick test_python_vector_rings;
+]
 
 let () =
   Alcotest.run "gdal" [
@@ -819,5 +1148,7 @@ let () =
     "RasterBand", raster_band_tests;
     "SpatialReference", spatial_ref_tests;
     "CoordinateTransformation", coord_transform_tests;
+    "Vector", vector_tests;
     "python comparison", python_tests;
+    "python comparison (vector)", python_vector_tests;
   ]
