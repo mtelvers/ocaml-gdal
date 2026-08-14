@@ -131,9 +131,15 @@ let check_ogr_err code =
     Error (Gdal_raw.cpl_get_last_error_msg ())
   else Ok ()
 
+(* GDAL leaves the error buffer empty for failures it does not consider
+   worth a message — a missing layer or driver name, say — so only append it
+   when there is something to append, rather than ending every such error
+   with a bare ": ". *)
 let check_null ptr what =
   if Ctypes.is_null ptr then
-    Error (Printf.sprintf "%s: %s" what (Gdal_raw.cpl_get_last_error_msg ()))
+    match Gdal_raw.cpl_get_last_error_msg () with
+    | "" -> Error what
+    | msg -> Error (Printf.sprintf "%s: %s" what msg)
   else Ok ptr
 
 (* ---- Initialization ---- *)
